@@ -1,0 +1,163 @@
+#!/bin/bash
+
+# Copyright (C) 2015 Sina Corp.
+#
+
+# Version
+VERSION="0.1"
+#LINUX_VERSION="2.6.32-504.1.3.el6.toa.4.x86_64"
+LINUX_VERSION="2.6.32-358.el6.toa.x86_64"
+RUNNING_LINUX_VERSION=`uname -r`
+if [[ $LINUX_VERSION != $RUNNING_LINUX_VERSION ]]
+then
+	echo "This is for Linux: $LINUX_VERSION"
+	echo "The running Linux: $RUNNING_LINUX_VERSION"
+	exit 1
+fi
+DATE="2015-7-6"
+AUTHOR="shixi_yongjian@staff.sina.com.cn"
+
+TOP=`cd $(dirname $0); pwd`
+SRCDIR="$TOP/src"
+
+# Targets
+
+# SystemTap options
+VERBOSE=""
+MODULE=""
+HIT=""
+
+# 0dive options
+
+function version {
+	echo "Copyright (C) 2015 Sina Corp."
+	echo "Version $VERSION $DATE"
+	echo "For Linux: $LINUX_VERSION"
+	echo ""
+}
+
+function usage {
+	echo "USAGE:"
+	echo "  ./0dive [options] [targets] [filters]"
+	echo ""
+	echo "OPTIONS:"
+	echo "  -A start/status/stop # Action: start, show status, stop"
+	echo "  -f            # save output to file"
+	echo "  -H            # probe hit report"
+	echo "  -v            # verbose mode"
+	echo "  -V            # show version"
+	echo "  -h            # show help"
+	echo ""
+}
+
+# Process cmdline options
+while getopts A:f:HvVh option
+do
+	case $option in
+	A) ACTION=$OPTARG;;
+	f) LOG=" -o $OPTARG ";;
+	H) HIT="-t";;
+	v) VERBOSE="-v";;
+	V) version
+	   exit 0;;
+	h|?|*)
+	   usage
+	   exit 1;;
+	esac
+done
+
+function is_running {
+	RUNNING_COUNT=$(sudo lsmod|grep 0dive|wc -l)
+	if [[ $RUNNING_COUNT -ne 0 ]];then
+		echo 1;
+	else
+		echo 0;
+	fi
+}
+
+# Actions
+if [[ $ACTION == "start" ]];then
+		echo "Action: start"
+elif [[ $ACTION == "stop" ]];then
+		echo "Action: stop"
+		if [ $(is_running) == 1 ];then
+			sudo killall stapio
+			sleep 1
+			echo
+			if [ $(is_running) == 1 ];then
+				echo "Failed to stop 0dive!"
+				exit 1;
+			else
+				echo "0dive stopped..."
+			fi
+		else
+			echo "0dive is not running..."
+		fi
+		exit
+elif [[ $ACTION == "status" ]];then
+		echo "Action: status"
+		if [[ $(is_running) -eq 1 ]];then
+			echo "0dive is running..."
+		else
+			echo "0dive is stopped..."
+		fi
+		exit
+elif [[ $ACTION != "" ]];then
+		echo "Bad action! -A start/status/stop"
+		exit
+else
+		echo "Default action: start"
+fi
+
+# avoid multi stapio
+if [[ $(is_running) == 1 ]];then
+		echo "0dive is already running..."
+		exit 1
+fi
+
+# use module
+MODULE="-p 4 -m 0dive"
+
+pushd $TOP/var/ >/dev/null 2>&1
+sudo rm $TOP/var/*.ko -f
+sudo stap -D STP_NO_OVERHEAD -D MAXACTION=10000000 -D MAXSTRINGLEN=10000 -DINTERRUPTIBLE=0 $VERBOSE $HIT $MODULE $REMOTE -w -g -I $SRCDIR -e '
+global force_exit = 0
+
+probe begin
+{
+	printf("probe begin\n")
+}
+
+//probe structs.* {}
+//probe estab.* {}
+//probe close.* {}
+probe rcvwnd.* {}
+
+probe end
+{
+	//if (!is_mem_alloc_stop())
+	//	mem_free_active()
+
+	//mem_report()
+	printf("\nprobe end\n")
+}
+'
+popd >/dev/null 2>&1
+
+if [ ! -r $TOP/var/0dive.ko ];then
+	echo "BUILD failed!"
+	exit 1
+fi
+
+sudo staprun $LOG -w $TOP/var/0dive.ko &
+sleep 1
+
+rm $TOP/var/0dive.ko
+
+echo
+if [ $(is_running) == 1 ];then
+	echo "0dive started..."
+else
+	echo "Failed to start 0dive!"
+	exit 1
+fi

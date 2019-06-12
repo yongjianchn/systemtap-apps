@@ -1,0 +1,49 @@
+%{
+	#include <linux/net.h>
+	#include <linux/tcp.h>
+	#include <net/tcp.h>
+
+	struct stap_info;
+%}
+
+//probe rcvwnd.new = kernel.function("tcp_select_window").return
+probe rcvwnd.change = kernel.statement(
+	"tcp_select_window@net/ipv4/tcp_output.c:275")
+{
+	if ($new_win < 1)
+		do_print_rcvwnd($sk)
+}
+
+function lock(sk) %{
+	bh_lock_sock((struct sock *)STAP_ARG_sk);
+%}
+
+function unlock(sk) %{
+	bh_unlock_sock((struct sock *)STAP_ARG_sk);
+%}
+
+function do_print_rcvwnd(sk)
+{
+	sip = format_ipaddr(ntohl(tcpmib_local_addr(sk)),
+		%{AF_INET%})
+	sport = tcpmib_local_port(sk)
+	rip = format_ipaddr(ntohl(tcpmib_remote_addr(sk)),
+		%{AF_INET%})
+	rport = tcpmib_remote_port(sk)
+	time = tz_ctime(gettimeofday_s())
+
+	printf("%s %s:%d - %s:%d\n",
+		time, sip, sport, rip, rport)
+
+	rcv_wup_new = %{((struct tcp_sock *)STAP_ARG_sk)->rcv_wup%}
+	rcv_nxt_new = %{((struct tcp_sock *)STAP_ARG_sk)->rcv_nxt%}
+	rcv_wnd_new = %{((struct tcp_sock *)STAP_ARG_sk)->rcv_wnd%}
+	copied_seq = %{((struct tcp_sock *)STAP_ARG_sk)->copied_seq%}
+
+	rcv_buf = %{((struct sock *)STAP_ARG_sk)->sk_rcvbuf%}
+
+	printf("\tcopied_seq=%d rcv_nxt=%d rcv_wnd=%d\n",
+		copied_seq, rcv_nxt_new, rcv_wnd_new)
+	printf("\tsk_rcvbuf=%d not_copied=%d\n",
+		rcv_buf, rcv_nxt_new-copied_seq)
+}
