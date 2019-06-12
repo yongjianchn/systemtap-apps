@@ -1,0 +1,131 @@
+# Command-line options
+
+global DEBUG=0
+global DEBUG_LOST=0
+%{
+	#include <linux/types.h>
+	//#define DEBUG_TCPDIVE
+
+	struct stap_info;
+
+	int stap_timeout = 0;
+	int stap_bitmap = 0;
+	int stap_interval = 0;
+	char stap_ipfile[100];
+	char stap_ips_str[10000];
+	int ips_str_len = 0;
+%}
+
+function process_cmdline:long ()
+{
+	for (i = 1; i <= argc; i++) {
+		argument = tokenize(argv[i], "=")
+
+		if (argument == "bitmap") {
+			argv[i] = ""
+			bitmap = strtol(tokenize(argv[i], "="), 10)
+			init_bitmap(bitmap)
+			continue
+		}
+
+		if (argument == "debug_lost") {
+			argv[i] = ""
+			DEBUG_LOST = strtol(tokenize(argv[i], "="), 10)
+			continue
+		}
+
+		if (argument == "timeout") {
+			argv[i] = ""
+			timeout = strtol(tokenize(argv[i], "="), 10)
+			init_killer(timeout)
+			continue
+		}
+
+		if (argument == "interval") {
+			argv[i] = ""
+			interval = strtol(tokenize(argv[i], "="), 10)
+			init_interval(interval)
+			continue
+		}
+
+		if (argument == "ip_file") {
+			argv[i] = ""
+			ip_file = tokenize(argv[i], "=")
+			init_ip_file(ip_file)
+			continue
+		}
+
+		if (argument == "ipstr") {
+			argv[i] = ""
+			ips_str = tokenize(argv[i], "=")
+			init_ips_str(ips_str)
+			continue
+		}
+	}
+
+	return 0
+}
+
+function init_bitmap (bitmap:long)
+%{
+	stap_bitmap = STAP_ARG_bitmap;
+
+	if (!stap_bitmap)
+		stap_bitmap = 255;
+%}
+
+function init_killer (time:long)
+%{
+	stap_timeout = STAP_ARG_time;
+%}
+
+function decr_read_timer (delta:long)
+%{
+	stap_timeout -= STAP_ARG_delta;
+	STAP_RETVALUE = stap_timeout;
+%}
+
+function init_interval (interval:long)
+{
+	if (do_init_interval(interval) == -1) {
+		printf("[tcpdive-fc] [WRONG] init_interval failed...\n")
+		force_exit = 1
+	}
+}
+
+function do_init_interval (interval:long)
+%{
+	stap_interval = STAP_ARG_interval;
+#ifdef DEBUG_TCPDIVE
+	printk("stap_interval: %d ms\n", stap_interval);
+#endif
+	if(stap_init_tcp_req_timer() == -1)
+		STAP_RETVALUE = -1;
+
+	STAP_RETVALUE = 0;
+%}
+
+function init_ip_file (ip_file)
+%{
+	strlcpy(stap_ipfile, STAP_ARG_ip_file, 100);
+%}
+
+function init_ips_str (ips_str)
+%{
+	strcpy(stap_ips_str, STAP_ARG_ips_str);
+	ips_str_len = strlen(stap_ips_str);
+%}
+
+/* Terminates the script in timeout seconds */
+probe tcpdive.killer = timer.s(1)
+{
+	if (%{stap_timeout%} <= 0)
+		next
+
+	if (decr_read_timer(1) <= 0) {
+		stop_mem_alloc()
+		mem_free_active()
+
+		exit()
+	}
+}

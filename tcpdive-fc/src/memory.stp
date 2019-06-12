@@ -1,0 +1,210 @@
+# Memory management
+
+%{
+	#include <linux/slab_def.h>
+	#include <net/inet_hashtables.h>
+
+	extern struct inet_hashinfo tcp_hashinfo;
+
+	atomic64_t stap_alloc = ATOMIC64_INIT(0);
+	atomic64_t stap_free = ATOMIC64_INIT(0);
+	atomic64_t stap_alloc_stop = ATOMIC64_INIT(0);
+	atomic64_t stap_free_intimer = ATOMIC64_INIT(0);
+	long stap_free_active = 0;
+
+	atomic64_t timer_count = ATOMIC64_INIT(0);
+	atomic64_t timer_stop_count_reqlost = ATOMIC64_INIT(0);
+	atomic64_t timer_stop_count_resplost = ATOMIC64_INIT(0);
+	atomic64_t timer_stop_count_resp = ATOMIC64_INIT(0);
+	atomic64_t timer_stop_count_close = ATOMIC64_INIT(0);
+	atomic64_t timer_stop_count_byself = ATOMIC64_INIT(0);
+	atomic64_t timer_stop_count_exit = ATOMIC64_INIT(0);
+%}
+
+function mem_alloc:long (sk:long, size:long)
+%{
+	void *ptr;
+
+	if (!atomic64_read(&stap_alloc_stop)) {
+		ptr = kmalloc(STAP_ARG_size, GFP_ATOMIC);
+
+		if (ptr == NULL)
+			STAP_RETVALUE = 1;
+		else {
+			memset(ptr, 0, STAP_ARG_size);
+			((struct sock *)STAP_ARG_sk)->sk_protinfo = ptr;
+			atomic64_inc(&stap_alloc);
+			STAP_RETVALUE = 0;
+		}
+	}
+%}
+
+function stop_mem_alloc ()
+%{
+	atomic64_set(&stap_alloc_stop, 1);
+%}
+
+function is_mem_alloc_stop:long ()
+%{
+	STAP_RETVALUE = atomic64_read(&stap_alloc_stop);
+%}
+
+function mem_leak:long ()
+%{
+	STAP_RETVALUE = atomic64_read(&stap_alloc) - atomic64_read(&stap_free)
+		- stap_free_active;
+%}
+
+function mem_free(sk:long)
+%{
+	struct sock *sk = (struct sock *)STAP_ARG_sk;
+	struct stap_info *info;
+	struct timer_list *timer;
+
+	spin_lock(&sk->stap_lock);
+	info = (struct stap_info *)sk->sk_protinfo;
+	if (info) {
+		timer = &info->req_timer;
+
+		/* If timer not setup, free info */
+		if (!atomic_read(&info->timer_is_set)) {
+			if (atomic_add_unless(&info->is_free, 1, 1)) {
+				kfree(info);
+				sk->sk_protinfo = NULL;
+				atomic64_inc(&stap_free);
+			}
+
+			goto stap_unlock;
+		}
+
+		/* Try to stop timer */
+		atomic_set(&info->want_probe, 0);
+
+		/* If timer_done(not pending/running), free info */
+		if (atomic_read(&info->timer_done)) {
+			if (atomic_add_unless(&info->is_free, 1, 1)) {
+				kfree(info);
+				sk->sk_protinfo = NULL;
+				atomic64_inc(&stap_free);
+			}
+		} else { /* timer is running, free info in timer */
+			atomic_set(&info->timer_should_free_info, 1);
+		}
+	}
+stap_unlock:
+	spin_unlock(&sk->stap_lock);
+%}
+
+function mem_free_active()
+%{
+	struct inet_hashinfo *hashinfo = &tcp_hashinfo;
+	struct stap_info *info;
+	struct inet_ehash_bucket *head;
+	struct hlist_nulls_node *node;
+	struct sock *sk;
+	spinlock_t *lock;
+	struct timer_list *timer;
+	int i;
+
+//	long alloc, free;
+//	alloc = atomic64_read(&stap_alloc);
+//	free = atomic64_read(&stap_free);
+//	printk("before: alloc=%ld free=%ld active=%ld active_free=%ld\n",
+//		alloc, free, alloc - free, stap_free_active);
+
+	for (i = 0; i < hashinfo->ehash_size; i++)
+	{
+		head = &hashinfo->ehash[i];
+		lock = inet_ehash_lockp(hashinfo, i);
+
+		if (hlist_nulls_empty(&head->chain))
+			continue;
+
+		spin_lock(lock);
+		sk_nulls_for_each(sk, node, &head->chain)
+		{
+			spin_lock(&sk->stap_lock);
+			info = (struct stap_info *)sk->sk_protinfo;
+			if (info) {
+				timer = &info->req_timer;
+
+				/* If timer not setup, free info */
+				if (!atomic_read(&info->timer_is_set)) {
+					if (atomic_add_unless(&info->is_free, 1, 1)) {
+						kfree(info);
+						sk->sk_protinfo = NULL;
+						stap_free_active++;
+					}
+
+					goto stap_unlock;
+				}
+
+				/* Try to stop timer */
+				atomic_set(&info->want_probe, 0);
+
+				/* If timer_done(not pending/running), free info */
+				if (atomic_read(&info->timer_done)) {
+					if (atomic_add_unless(&info->is_free, 1, 1)) {
+						kfree(info);
+						sk->sk_protinfo = NULL;
+						stap_free_active++;
+					}
+				} else { /* timer is running, free info in timer */
+					atomic_set(&info->timer_should_free_info, 1);
+				}
+			}
+		stap_unlock:
+			spin_unlock(&sk->stap_lock);
+		}
+		spin_unlock(lock);
+	}
+
+//	alloc = atomic64_read(&stap_alloc);
+//	free = atomic64_read(&stap_free);
+//	printk("after: alloc=%ld free=%ld active=%ld active_free=%ld\n",
+//		alloc, free, alloc - free, stap_free_active);
+%}
+
+function mem_report()
+{
+	alloc = %{atomic64_read(&stap_alloc)%}
+	freed = %{atomic64_read(&stap_free)%}
+	freed_intimer = %{atomic64_read(&stap_free_intimer)%}
+	active = alloc - freed - freed_intimer
+	active_freed = %{stap_free_active%}
+	not_freed = active - active_freed
+
+	timer_count = %{atomic64_read(&timer_count)%}
+	timer_stop_count_reqlost = %{atomic64_read(&timer_stop_count_reqlost)%}
+	timer_stop_count_resplost = %{atomic64_read(&timer_stop_count_resplost)%}
+	timer_stop_count_resp = %{atomic64_read(&timer_stop_count_resp)%}
+	timer_stop_count_close = %{atomic64_read(&timer_stop_count_close)%}
+	timer_stop_count_byself = %{atomic64_read(&timer_stop_count_byself)%}
+	timer_stop_count_exit = %{atomic64_read(&timer_stop_count_exit)%}
+	timer_not_stop = timer_count - timer_stop_count_reqlost - timer_stop_count_resplost
+		 - timer_stop_count_resp - timer_stop_count_close - timer_stop_count_byself - timer_stop_count_exit
+
+	server_create = %{server_create%}
+	server_true = %{server_true%}
+	server_true_free = %{server_true_free%}
+	server_other_free = %{server_other_free%}
+
+	printf("%-24s %d\n", "stap_info alloc", alloc)
+	printf("%-24s %d\n", "free(close, exit)", freed)
+	printf("%-24s %d\n", "free(in timer)", freed_intimer)
+	printf("%-24s %d\n", "active stap_info", active)
+	printf("%-24s %d\n", "active stap_info free", active_freed)
+	printf("%-24s %d\n", "free(in future)", timer_not_stop)
+	printf("%-24s %d\n", "leak", not_freed - timer_not_stop)
+	printf("\n");
+	printf("%-24s %d\n", "timer setup", timer_count)
+	/*
+	printf("%-24s %d\n", "timer stop: req lost", timer_stop_count_reqlost)
+	printf("%-24s %d\n", "timer stop: resp lost", timer_stop_count_resplost)
+	printf("%-24s %d\n", "timer stop: get resp", timer_stop_count_resp)
+	printf("%-24s %d\n", "timer stop: tcp close", timer_stop_count_close)
+	printf("%-24s %d\n", "timer stop: when exit", timer_stop_count_exit)
+	*/
+	printf("%-24s %d\n", "stop(in timer)", timer_stop_count_byself)
+	printf("%-24s %d\n", "stop(in future)", timer_not_stop)
+}

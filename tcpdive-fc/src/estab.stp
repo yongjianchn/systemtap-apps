@@ -1,0 +1,61 @@
+%{
+	#include <net/tcp.h>
+	#include <linux/rtc.h>
+	#include <linux/timer.h>
+
+	struct stap_info;
+%}
+
+probe estab.rcv_synack =
+	kernel.statement(
+			"tcp_rcv_synsent_state_process@net/ipv4/tcp_input.c:5618")
+{
+	raddr = tcpmib_remote_addr($sk)
+	rport = tcpmib_remote_port($sk)
+
+	if (!is_cared(raddr) || is_mem_alloc_stop())
+		next
+
+	if (mem_alloc($sk, %{sizeof(struct stap_info)%})) {
+		printf("Memory alloc failed!!!\n")
+		exit
+	}
+
+	synack_seq = do_rcv_synack($sk, $skb, gettimeofday_s())
+	if (DEBUG)
+		printf("\n\n[estab] synack_seq: %u\n", synack_seq)
+}
+
+function is_cared(ip)
+%{
+	long ip = STAP_ARG_ip;
+
+	if (find_server(&servertree, ip))
+		STAP_RETVALUE = 1;
+	else
+		STAP_RETVALUE = 0;
+%}
+
+function do_rcv_synack(sk, skb, seconds:long)
+%{
+	struct sock *sk = (struct sock *)STAP_ARG_sk;
+	struct sk_buff *skb = (struct sk_buff *)STAP_ARG_skb;
+	long seconds = STAP_ARG_seconds;
+	struct stap_info *info = sk->sk_protinfo;
+	u32 seq = TCP_SKB_CB(skb)->seq;
+
+	if (!info)
+		return;
+
+#ifdef DEBUG_TCPDIVE
+	printk("do_rcv_synack ->\n");
+#endif
+	spin_lock_init(&sk->stap_lock);
+	info->conn_time = seconds;
+	info->synack_seq = seq;
+	info->estab_timestamp = tcp_time_stamp;
+	STAP_RETVALUE = seq;
+#ifdef DEBUG_TCPDIVE
+	printk("<- do_rcv_synack\n");
+#endif
+%}

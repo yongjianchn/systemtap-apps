@@ -1,0 +1,49 @@
+%{
+	#include <net/tcp.h>
+	#include <linux/rtc.h>
+	#include <linux/timer.h>
+
+	/* Records for One TCP Connection */
+	struct stap_info {
+		/* Estab time */
+		long conn_time; /* seconds from UNIX epoch */
+		u32 estab_timestamp; /* jiffies */
+
+		/* Close time */
+		u32 close_timestamp; /* jiffies */
+
+		/* Interval between estab and first request/response */
+		u32 req_delay;
+		u32 resp_delay;
+
+		/* send */
+		u32 sent_pkts; /* Number of pkts sended */
+		u32 req_nxt; /* the last seq of request pkts +1 */
+		u32 req_pkt_num; /* Number of pkts of the request */
+
+		/* receive */
+		u32 synack_seq; /* the seq of received synack */
+
+		/* send probe pkts to get insight of this tcp connection */
+		struct timer_list req_timer;
+		atomic_t want_probe;
+		u32 small_ack_count;
+		u32 is_req_lost;
+		u32 is_resp_lost;
+		u32 is_resp_null;
+
+		/* For mem free */
+		atomic_t is_free;
+		atomic_t timer_is_set;
+		atomic_t timer_done;
+		atomic_t timer_should_free_info;
+	};
+
+	enum {
+		STAPF_KILLER = (1 << 7)
+	};
+
+	#define INIT_VALUE (unsigned(-1))
+%}
+
+probe structs.start = never {}

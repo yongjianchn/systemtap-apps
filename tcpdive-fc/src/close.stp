@@ -1,0 +1,131 @@
+%{
+	#include <net/tcp.h>
+
+	struct stap_info;
+%}
+
+probe close.lastack = kernel.function("tcp_set_state")
+{
+	if (!$sk->sk_protinfo)
+		next
+
+	newstate = $state
+	if (newstate == %{TCP_CLOSE%}) {
+
+		if (! is_mem_alloc_stop()) {
+			ret = do_close($sk)
+			if (DEBUG)
+				show_connect($sk)
+
+			if (DEBUG_LOST) {
+				sip = tcpmib_local_addr($sk)
+				sip_str = format_ipaddr(ntohl(sip), %{AF_INET%})
+				sport = tcpmib_local_port($sk)
+				rip = tcpmib_remote_addr($sk)
+				rip_str = format_ipaddr(ntohl(rip), %{AF_INET%})
+				rport = tcpmib_remote_port($sk)
+
+				time = tz_ctime(gettimeofday_s())
+
+				if (ret == 1) {
+					printf("[tcpdive-fc] %s req_lost %s:%d - %s:%d\n"
+						, time, sip_str, sport, rip_str, rport)
+				}
+				else if (ret == 2) {
+					printf("[tcpdive-fc] %s resp_lost %s:%d - %s:%d\n"
+						, time, sip_str, sport, rip_str, rport)
+				}
+				else if (ret == 3) {
+					printf("[tcpdive-fc] %s no_resp %s:%d - %s:%d\n"
+						, time, sip_str, sport, rip_str, rport)
+				}
+			}
+		}
+		mem_free($sk)
+	}
+}
+
+function do_close(sk:long)
+%{
+	struct sock *sk = (struct sock *)STAP_ARG_sk;
+	struct inet_sock *inet_sk = (struct inet_sock *)sk;
+	struct stap_info *info = sk->sk_protinfo;
+	long daddr = be32_to_cpu(inet_sk->daddr);
+	struct server_info *server = find_server(&servertree, daddr);
+
+	if (!info)
+		return;
+	if (!server) {
+		printk("BUG: has *info, but no server_info found.\n");
+		return;
+	}
+
+#ifdef DEBUG_TCPDIVE
+	printk("do_close ->\n");
+#endif
+	/* record close time stamp */
+	if (info->close_timestamp != 0)
+		return;
+	info->close_timestamp = tcp_time_stamp;
+	STAP_RETVALUE=0;
+
+	/* update server info */
+	if (info->is_req_lost) {
+		atomic64_inc(&server->req_lost_count);
+		STAP_RETVALUE=1;
+	}
+	if (info->is_resp_lost) {
+		atomic64_inc(&server->resp_lost_count);
+		STAP_RETVALUE=2;
+	}
+	if (info->is_resp_null) {
+		atomic64_inc(&server->resp_null_count);
+		STAP_RETVALUE=3;
+	}
+
+#ifdef DEBUG_TCPDIVE
+	printk("<- do_close\n");
+#endif
+%}
+
+probe close.destruct =
+	kernel.function("inet_sock_destruct")
+{
+	if (!$sk->sk_protinfo)
+		next
+
+	if (! is_mem_alloc_stop()) {
+			do_close($sk)
+			if (DEBUG)
+				show_connect($sk)
+	}
+	mem_free($sk)
+}
+
+probe close.signal =
+	signal.send
+{
+	if (!is_mem_alloc_stop() &&
+			(sig_name == "SIGINT" || sig_name == "SIGTERM") &&
+			pid_name == "stapio") {
+		stop_mem_alloc()
+		mem_free_active()
+	}
+}
+
+function show_connect(sk:long)
+{
+	raddr = tcpmib_remote_addr(sk)
+	rport = tcpmib_remote_port(sk)
+	time = %{((struct stap_info *)((struct sock *)STAP_ARG_sk)->sk_protinfo)->conn_time%}
+	is_req_lost = %{((struct stap_info *)((struct sock *)STAP_ARG_sk)->sk_protinfo)->is_req_lost%}
+	is_resp_lost = %{((struct stap_info *)((struct sock *)STAP_ARG_sk)->sk_protinfo)->is_resp_lost%}
+	is_resp_null = %{((struct stap_info *)((struct sock *)STAP_ARG_sk)->sk_protinfo)->is_resp_null%}
+
+	format_ip = sprintf("%s:%d", ip_ntop(htonl(raddr)), rport)
+	format_time = ctime(time + 3600*8)
+	printf("[CLOSE] REMOTE: %s TIME: %s\n",
+			format_ip, format_time)
+	printf("        req_lost: %d resp_lost: %d resp_null: %d\n",
+			is_req_lost, is_resp_lost, is_resp_null)
+}

@@ -1,0 +1,250 @@
+#!/bin/bash
+
+# Copyright (C) 2015 Sina Corp.
+#
+# Name:
+#	tcpdive-fc: tcpdive for clients
+#	A TCP performance profiling tool for Linux clients.
+#
+# Description:
+# Tcpdive-fc is designed to provide an insight into TCP performance.
+# It uses systemtap to collect data from a running linux kernel.
+
+# Version
+VERSION="1.0"
+#LINUX_VERSION="2.6.32-504.1.3.el6.toa.3.x86_64"
+LINUX_VERSION="2.6.32-504.1.3.el6.toa.4.x86_64"
+RUNNING_LINUX_VERSION=`uname -r`
+if [[ $LINUX_VERSION != $RUNNING_LINUX_VERSION ]]
+then
+	echo "This is for Linux: $LINUX_VERSION"
+	echo "The running Linux: $RUNNING_LINUX_VERSION"
+	exit 1
+fi
+DATE="2015-5-26"
+AUTHOR="shixi_yongjian@staff.sina.com.cn"
+
+TOP=`cd $(dirname $0); pwd`
+SRCDIR="$TOP/src"
+
+# Targets
+KILLER="never"
+
+KILLER_BIT=128
+
+BITMAP=0
+
+# SystemTap options
+VERBOSE=""
+MODULE=""
+REMOTE=""
+HIT=""
+
+# Tcpdive options
+TIME=""
+LTIME=0
+SAMPLE=0
+FILTER=""
+IP_FILE=""
+INTERVAL=10
+DEBUG_LOST=0
+LOG=""
+
+function version {
+	echo "Copyright (C) 2015 Sina Corp."
+	echo "Version $VERSION $DATE"
+	echo "For Linux: $LINUX_VERSION"
+	echo ""
+}
+
+function usage {
+	echo "USAGE:"
+	echo "  ./tcpdive [options] [targets] [filters]"
+	echo ""
+	echo "OPTIONS:"
+	echo "  -h            # show help"
+	echo "  -d            # show details for bad service"
+	echo "  -f            # save output to file"
+	echo "  -H            # probe hit report"
+	echo "  -v            # verbose mode"
+	echo "  -V            # show version"
+	echo "  -r <host>     # run on remote host"
+	echo "  -t <sec>      # specify running time"
+	echo "  -I <ip file>  # specify the file contains ip"
+	echo "  -i <msec>     # interval of probe pkts, default: 10ms"
+	echo "  -A start/status/stop # Action: start, show status, stop"
+	echo ""
+}
+
+# Process cmdline options
+while getopts hHvVM:r:t:I:i:A:f:d option
+do
+	case $option in
+	A) ACTION=$OPTARG;;
+	f) LOG=" -o $OPTARG ";;
+	d) DEBUG_LOST=1;;
+	H) HIT="-t";;
+	v) VERBOSE="-v";;
+	V) version
+	   exit 0;;
+	r) REMOTE="$REMOTE --remote=$OPTARG";;
+	t) TIME=$OPTARG
+	   KILLER="tcpdive.killer"
+	   BITMAP=$(($BITMAP+$KILLER_BIT));;
+	I) IP_FILE=$OPTARG;;
+	i) INTERVAL=$OPTARG;;
+	h|?|*)
+	   usage
+	   exit 1;;
+	esac
+done
+
+# Check options
+if [[ $DEBUG_LOST -eq 1 && $LOG = "" ]];then
+	echo "-d option requires -f file"
+	exit 1
+fi
+
+function is_running {
+	RUNNING_COUNT=$(sudo lsmod|grep tcpdive_fc|wc -l)
+	if [[ $RUNNING_COUNT -ne 0 ]];then
+		echo 1;
+	else
+		echo 0;
+	fi
+}
+
+# Actions
+if [[ $ACTION == "start" ]];then
+		echo "Action: start"
+elif [[ $ACTION == "stop" ]];then
+		echo "Action: stop"
+		if [ $(is_running) == 1 ];then
+			sudo killall stapio
+			sleep 2
+			echo
+			if [ $(is_running) == 1 ];then
+				echo "Failed to stop tcpdive-fc!"
+				exit 1;
+			else
+				echo "tcpdive-fc stopped..."
+			fi
+		else
+			echo "tcpdive-fc is not running..."
+		fi
+		exit
+elif [[ $ACTION == "status" ]];then
+		echo "Action: status"
+		if [[ $(is_running) -eq 1 ]];then
+			echo "tcpdive-fc is running..."
+		else
+			echo "tcpdive-fc is stopped..."
+		fi
+		exit
+elif [[ $ACTION != "" ]];then
+		echo "Bad action! -A start/status/stop"
+		exit
+else
+		echo "Default action: start"
+fi
+
+# convert ipfile to Another format
+if [ -z $IP_FILE ]
+then
+	usage
+	exit 1
+fi
+
+if [ ! -r $IP_FILE ]; then
+	echo "File: $IP_FILE not exist!"
+	exit 1
+fi
+
+TMPIPFILE="$TOP/var/ipfile.tmp"
+touch $TMPIPFILE
+if [ ! -r $TMPIPFILE ]; then
+	echo "Can't read $TMPIPFILE!"
+	exit 1
+fi
+if [ ! -w $TMPIPFILE ]; then
+	echo "Can't write $TMPIPFILE!"
+	exit 1
+fi
+$TOP/tools/ip2int.awk $IP_FILE > $TMPIPFILE
+ERROR_IP=`grep -i Wrong $TMPIPFILE`
+if [[ -n $ERROR_IP ]]; then
+	grep -i Wrong $TMPIPFILE
+	exit 1
+fi
+HAS_IP=`cat $TMPIPFILE|wc -l`
+if [[ $HAS_IP == 0 ]]; then
+	echo "No target IP!"
+	exit 1
+fi
+IPS_STR=`cat $TMPIPFILE | tr '\n' ','`
+sync
+
+# avoid multi stapio
+if [[ $(is_running) == 1 ]];then
+		echo "tcpdive-fc is already running..."
+		exit 1
+fi
+
+# use module
+MODULE="-p 4 -m tcpdive_fc"
+
+pushd $TOP/var/ >/dev/null 2>&1
+sudo rm $TOP/var/*.ko -f
+sudo stap -D STP_NO_OVERHEAD -D MAXSKIPPED=102400 -D MAXACTION=100000 -D MAXSTRINGLEN=10000 -DINTERRUPTIBLE=0 $VERBOSE $HIT $MODULE $REMOTE -w -g -I $SRCDIR -e '
+global force_exit = 0
+
+probe begin
+{
+	printf("probe begin\n")
+	if (process_cmdline() < 0)
+		exit()
+
+	if (force_exit) {
+		exit()
+	} else {
+		setup_servers()
+		printf("target server setup ok!\n")
+	}
+}
+
+probe structs.* {}
+probe estab.* {}
+probe close.* {}
+probe trans.send {}
+probe trans.recv {}
+probe analy.* {}
+
+probe '$KILLER' {}
+
+probe end
+{
+	if (force_exit) {
+		exit()
+	} else {
+		if (!is_mem_alloc_stop())
+			mem_free_active()
+
+		show_all_servers()
+		clean_servers()
+
+		mem_report()
+		printf("\n\nprobe end\n")
+	}
+}
+' ipstr=$IPS_STR bitmap=$BITMAP debug_lost=$DEBUG_LOST timeout=$TIME ip_file=$TMPIPFILE interval=$INTERVAL
+popd >/dev/null 2>&1
+
+sudo staprun $LOG -w $TOP/var/tcpdive_fc.ko &
+sleep 1
+echo
+if [ $(is_running) == 1 ];then
+	echo "tcpdive-fc started..."
+else
+	echo "Failed to start tcpdive_fc!"
+	exit 1
+fi

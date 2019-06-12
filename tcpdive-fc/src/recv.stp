@@ -1,0 +1,55 @@
+%{
+	#include <net/tcp.h>
+	#include <linux/timer.h>
+	struct stap_info;
+%}
+
+probe trans.recv =
+	kernel.function("tcp_event_data_recv")
+{
+	if (!$sk->sk_protinfo || is_mem_alloc_stop())
+		next
+
+	do_recv($sk, $skb)
+	if (DEBUG)
+		printf("[recv]\n")
+}
+
+function do_recv(sk:long, skb:long)
+%{
+	struct sock *sk = (struct sock *)STAP_ARG_sk;
+	struct sk_buff *skb = (struct sk_buff *)STAP_ARG_skb;
+	struct stap_info *info = NULL;
+	u32 resp_seq = TCP_SKB_CB(skb)->seq;
+	u32 resp_ack = TCP_SKB_CB(skb)->ack_seq;
+	struct timer_list *timer = NULL;
+
+	spin_lock(&sk->stap_lock);
+	info = sk->sk_protinfo;
+	if (!info)
+		goto unlock;
+
+	timer = &info->req_timer;
+#ifdef DEBUG_TCPDIVE
+	printk("recv ->\n");
+#endif
+	/* Only care about the first pkt of response */
+	if (resp_seq == info->synack_seq + 1) {
+		/*
+		 * Get Response, So we:
+		 * 1. reset probing flag
+		 * 2. stop timer;
+		 * 3. reset probe results;
+		 */
+		atomic_set(&info->want_probe, 0);
+		info->is_req_lost = 0;
+		info->is_resp_lost = 0;
+		info->is_resp_null = 0;
+	}
+#ifdef DEBUG_TCPDIVE
+	printk("<- recv\n");
+#endif
+
+unlock:
+	spin_unlock(&sk->stap_lock);
+%}

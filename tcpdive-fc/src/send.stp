@@ -1,0 +1,70 @@
+%{
+	#include <net/tcp.h>
+	#include <linux/timer.h>
+	struct stap_info;
+%}
+
+probe trans.send =
+	kernel.statement("tcp_write_xmit@net/ipv4/tcp_output.c:1810")
+{
+	if (!$sk->sk_protinfo || is_mem_alloc_stop())
+		next
+
+	req_nxt = do_send($sk, $sent_pkts)
+	if (DEBUG)
+		printf("[req] has %d pkts. req_nxt: %u\n", $sent_pkts, req_nxt)
+}
+
+function do_send(sk:long, cnt:long)
+%{
+	struct sock *sk = (struct sock*)STAP_ARG_sk;
+	struct inet_sock *inet_sk = (struct inet_sock *)sk;
+	struct tcp_sock *tcp_sk = (struct tcp_sock *)STAP_ARG_sk;
+	struct stap_info *info = NULL;
+	long daddr = be32_to_cpu(inet_sk->daddr);
+	struct server_info *server = find_server(&servertree, daddr);
+
+	spin_lock(&sk->stap_lock);
+	info = sk->sk_protinfo;
+	if (!info)
+		goto unlock;
+	if(!server) {
+		printk("BUG: has *info ,but no server_info found!\n");
+		goto unlock;
+	}
+
+#ifdef DEBUG_TCPDIVE
+	printk("do_send ->\n");
+#endif
+	/* Request may contains many pkts
+	 * And write_seq may not be the req_seq_nxt
+	 * So, we continue to update req_nxt to avoid error report
+	 * If not, we may take req_lost as resp_null.
+	 */
+	info->req_pkt_num += STAP_ARG_cnt;
+	info->req_nxt = tcp_sk->write_seq;
+	STAP_RETVALUE = info->req_nxt;
+
+	/* count ++ and setup_timer should only be done when we met new request */
+	if (!info->sent_pkts) {
+		/* increase total conn count for the remote server */
+		atomic64_inc(&server->total_count);
+
+		/* Active req_timer */
+		atomic_set(&info->timer_is_set, 1);
+		setup_timer(&info->req_timer, &stap_tcp_request_timer,
+				(unsigned long)sk);
+		atomic64_inc(&timer_count);
+		sk_reset_timer(sk, &info->req_timer,
+			jiffies + msecs_to_jiffies(stap_tcp_request_time));
+		atomic_set(&info->want_probe, 1);
+	}
+
+	info->sent_pkts += STAP_ARG_cnt;
+#ifdef DEBUG_TCPDIVE
+	printk("<- do_send\n");
+#endif
+
+unlock:
+	spin_unlock(&sk->stap_lock);
+%}
